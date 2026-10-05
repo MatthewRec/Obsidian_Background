@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Obsidian Graph Wallpaper</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #1e1e1e; }
+  #graph { width: 100%; height: 100%; }
+  /* Lively's WebView2 renderer doesn't forward mouse wheel/drag to web
+     wallpapers, but it does forward clicks - so zoom is click-driven here. */
+  #zoom-controls {
+    position: fixed;
+    right: 24px;
+    bottom: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 10;
+  }
+  #zoom-controls button {
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: rgba(255,255,255,0.08);
+    color: rgba(255,255,255,0.7);
+    font-size: 20px;
+    font-family: sans-serif;
+    line-height: 1;
+    cursor: pointer;
+  }
+  #zoom-controls button:hover { background: rgba(255,255,255,0.18); color: #fff; }
+  #zoom-controls button:active { background: rgba(255,255,255,0.28); }
+</style>
+<script src="node_modules/d3-quadtree/dist/d3-quadtree.min.js"></script>
+<script src="node_modules/d3-force/dist/d3-force.min.js"></script>
+<script src="node_modules/force-graph/dist/force-graph.min.js"></script>
+</head>
+<body>
+<div id="graph"></div>
+<div id="zoom-controls">
+  <button id="zoom-in" title="Zoom in">+</button>
+  <button id="zoom-out" title="Zoom out">&minus;</button>
+  <button id="zoom-fit" title="Fit graph to screen">&#10021;</button>
+</div>
+<script src="graph-data.js"></script>
+<script>
+(function () {
+  var POLL_MS = 10000;
+  var BASE_NODE_PX = 2.6;
+  var BASE_LINK_PX = 0.4;
+  var BASE_FONT_PX = 18;
+  var REPEL_STRENGTH = -160;
+
+  var el = document.getElementById('graph');
+  var liveNodes = new Map(); // id -> node object (kept for x/y/vx/vy continuity)
+  var liveLinks = new Map(); // "a->b" -> link object
+  var neighborsOf = new Map(); // id -> Set(neighbor ids)
+  var hoveredNode = null;
+
+  var forces = (window.GRAPH && window.GRAPH.forces) || {};
+  var colors = (window.GRAPH && window.GRAPH.colors) || {};
+  var background = colors.background || '#1e1e1e';
+  var defaultLinkColor = colors.defaultLink || 'rgba(255,255,255,0.15)';
+
+  var Graph = ForceGraph()(el)
+    .backgroundColor(background)
+    .nodeRelSize(1)
+    .nodeColor(function (n) { return n.color || '#8a8a8a'; })
+    .linkColor(function (l) {
+      if (hoveredNode && !isDimmed(l)) return 'rgba(255,255,255,0.55)';
+      return defaultLinkColor;
+    })
+    .linkWidth(function () { return (forces.lineSizeMultiplier || 1) * BASE_LINK_PX; })
+    .nodeCanvasObject(drawNode)
+    .nodePointerAreaPaint(paintPointerArea)
+    .onNodeHover(function (node) {
+      hoveredNode = node || null;
+      el.style.cursor = node ? 'pointer' : 'default';
+    })
+    .onNodeClick(function (node) {
+      if (!node || !node.resolved) return;
+      var filePath = node.id.replace(/\.md$/i, '');
+      var url = 'obsidian://open?vault=Obsidian&file=' + encodeURIComponent(filePath);
+      window.location.href = url;
+    });
+
+  Graph.d3Force('link').distance(forces.linkDistance || 91).strength(forces.linkStrength != null ? forces.linkStrength : 1);
+  // Obsidian's own repelStrength is 0 in this vault (fine there, since a human
+  // pans/zooms the real graph view). On an unattended wallpaper that collapses
+  // everything, so this deliberately overrides it with real repulsion to
+  // spread nodes across the screen instead of clustering them all together.
+  Graph.d3Force('charge', d3.forceManyBody().strength(REPEL_STRENGTH));
+  Graph.d3Force('collide', d3.forceCollide(nodeRadius));
+  // force-graph registers its own default 'center' force (d3.forceCenter())
+  // that isn't exposed anywhere in its public API docs - this is what kept
+  // recentering the whole graph even after the custom anchor force was
+  // removed. Disable it outright: centering is now fully manual (fit button).
+  Graph.d3Force('center', null);
+  // Ideas.md/Projects.md/Research.md are the vault's three hub notes but
+  // don't link to each other, so with no centering force at all they'd drift
+  // apart forever under mutual repulsion. A hand-written force (not
+  // d3.forceLink, which throws if the referenced nodes don't exist yet at
+  // registration time) pulls them toward each other without constraining how
+  // their own sub-clusters spread out internally, and just no-ops until the
+  // first graphData() call populates the node list.
+  Graph.d3Force('hubAttract', hubAttractForce(['Ideas.md', 'Projects.md', 'Research.md'], 350, 0.25));
+
+  function hubAttractForce(ids, targetDistance, strength) {
+    var nodesRef = [];
+    function force(alpha) {
+      var byId = {};
+      nodesRef.forEach(function (n) { byId[n.id] = n; });
+      for (var i = 0; i < ids.length; i++) {
+        var a = byId[ids[i]];
+        var b = byId[ids[(i + 1) % ids.length]];
+        if (!a || !b) continue;
+        var dx = b.x - a.x, dy = b.y - a.y;
+        var dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        var k = ((dist - targetDistance) / dist) * strength * alpha;
+        var ox = dx * k, oy = dy * k;
+        a.vx += ox; a.vy += oy;
+        b.vx -= ox; b.vy -= oy;
+      }
+    }
+    force.initialize = function (nodes) { nodesRef = nodes; };
+    return force;
+  }
+  Graph.d3AlphaDecay(0.02);
+  Graph.d3VelocityDecay(0.4);
+  // No periodic reheat, and no forced-infinite cooldown either - per user
+  // request, the graph should settle once and then actually stop (both
+  // visually and for CPU use), not shift on its own indefinitely. It still
+  // reheats when data actually changes (a note added/removed - see the
+  // "changed" check in mergeGraphData below), just never on a timer.
+
+  function nodeRadius(node) {
+    var mult = forces.nodeSizeMultiplier || 1;
+    return (2 + Math.sqrt(node.degree || 0)) * mult * BASE_NODE_PX;
+  }
+
+  function isDimmed(link) {
+    if (!hoveredNode) return false;
+    var sId = typeof link.source === 'object' ? link.source.id : link.source;
+    var tId = typeof link.target === 'object' ? link.target.id : link.target;
+    return sId !== hoveredNode.id && tId !== hoveredNode.id;
+  }
+
+  function drawNode(node, ctx, globalScale) {
+    var r = nodeRadius(node);
+    var dimmed = hoveredNode && hoveredNode.id !== node.id &&
+      !(neighborsOf.get(hoveredNode.id) && neighborsOf.get(hoveredNode.id).has(node.id));
+
+    ctx.globalAlpha = dimmed ? 0.25 : 1;
+    ctx.beginPath();
+    ctx.arc(node.x, node.y, r, 0, 2 * Math.PI, false);
+    ctx.fillStyle = node.color || '#8a8a8a';
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // Labels are always shown, at a roughly constant on-screen size regardless
+    // of zoom (font size is scaled by 1/globalScale), so names stay readable
+    // even zoomed far out.
+    var alpha = dimmed ? 0.3 : 1;
+    var fontSize = BASE_FONT_PX / globalScale;
+    ctx.font = fontSize + 'px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = 'rgba(255,255,255,' + alpha.toFixed(3) + ')';
+    ctx.fillText(node.name, node.x, node.y + r + 2);
+  }
+
+  function paintPointerArea(node, color, ctx) {
+    var r = nodeRadius(node);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(node.x, node.y, r, 0, 2 * Math.PI, false);
+    ctx.fill();
+  }
+
+  function rebuildNeighbors(links) {
+    neighborsOf.clear();
+    links.forEach(function (l) {
+      var sId = typeof l.source === 'object' ? l.source.id : l.source;
+      var tId = typeof l.target === 'object' ? l.target.id : l.target;
+      if (!neighborsOf.has(sId)) neighborsOf.set(sId, new Set());
+      if (!neighborsOf.has(tId)) neighborsOf.set(tId, new Set());
+      neighborsOf.get(sId).add(tId);
+      neighborsOf.get(tId).add(sId);
+    });
+  }
+
+  function mergeGraphData(newData) {
+    var incomingIds = new Set();
+    var mergedNodes = [];
+    var changed = false;
+
+    (newData.nodes || []).forEach(function (n) {
+      incomingIds.add(n.id);
+      var existing = liveNodes.get(n.id);
+      if (existing) {
+        existing.name = n.name;
+        existing.color = n.color;
+        existing.degree = n.degree;
+        existing.resolved = n.resolved;
+        existing.type = n.type;
+        mergedNodes.push(existing);
+      } else {
+        liveNodes.set(n.id, n);
+        mergedNodes.push(n);
+        changed = true;
+      }
+    });
+    for (var id of Array.from(liveNodes.keys())) {
+      if (!incomingIds.has(id)) {
+        liveNodes.delete(id);
+        changed = true;
+      }
+    }
+
+    var incomingLinkKeys = new Set();
+    var mergedLinks = [];
+    (newData.links || []).forEach(function (l) {
+      var key = [l.source, l.target].sort().join('->');
+      incomingLinkKeys.add(key);
+      var existing = liveLinks.get(key);
+      if (existing) {
+        mergedLinks.push(existing);
+      } else {
+        liveLinks.set(key, l);
+        mergedLinks.push(l);
+        changed = true;
+      }
+    });
+    for (var key of Array.from(liveLinks.keys())) {
+      if (!incomingLinkKeys.has(key)) {
+        liveLinks.delete(key);
+        changed = true;
+      }
+    }
+
+    // force-graph's graphData setter always reheats the simulation (alpha
+    // back to 1) as a side effect, even when passed the same nodes/links, so
+    // it must only be called when something actually changed - otherwise the
+    // periodic poll below would keep reheating (and visibly moving) the
+    // graph every 10s forever, even at rest.
+    if (changed) {
+      rebuildNeighbors(mergedLinks);
+      Graph.graphData({ nodes: mergedNodes, links: mergedLinks });
+    }
+  }
+
+  function pollGraphData() {
+    var script = document.createElement('script');
+    script.src = 'graph-data.js?v=' + Date.now();
+    script.onload = function () {
+      script.remove();
+      mergeGraphData(window.GRAPH);
+    };
+    script.onerror = function () { script.remove(); };
+    document.body.appendChild(script);
+  }
+
+  if (window.GRAPH) mergeGraphData(window.GRAPH);
+  setInterval(pollGraphData, POLL_MS);
+
+  var ZOOM_FACTOR = 1.5;
+  var ZOOM_DURATION_MS = 350;
+  document.getElementById('zoom-in').addEventListener('click', function () {
+    Graph.zoom(Graph.zoom() * ZOOM_FACTOR, ZOOM_DURATION_MS);
+  });
+  document.getElementById('zoom-out').addEventListener('click', function () {
+    Graph.zoom(Graph.zoom() / ZOOM_FACTOR, ZOOM_DURATION_MS);
+  });
+  document.getElementById('zoom-fit').addEventListener('click', function () {
+    Graph.zoomToFit(600, 60);
+  });
+
+  function resize() {
+    Graph.width(el.clientWidth).height(el.clientHeight);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+})();
+</script>
+</body>
+</html>
